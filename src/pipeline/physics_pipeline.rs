@@ -668,6 +668,100 @@ impl PhysicsPipeline {
 
         self.counters.step_completed();
     }
+
+
+    /// Update without physics simulation.
+    pub fn update(
+        &mut self,
+        gravity: &Vector<Real>,
+        integration_parameters: &IntegrationParameters,
+        islands: &mut IslandManager,
+        broad_phase: &mut BroadPhaseBvh,
+        narrow_phase: &mut NarrowPhase,
+        bodies: &mut RigidBodySet,
+        colliders: &mut ColliderSet,
+        impulse_joints: &mut ImpulseJointSet,
+        multibody_joints: &mut MultibodyJointSet,
+        ccd_solver: &mut CCDSolver,
+        hooks: &dyn PhysicsHooks,
+        events: &dyn EventHandler,
+    ) {
+        self.counters.reset();
+        self.counters.step_started();
+
+        // Apply modifications.
+        let mut modified_colliders = colliders.take_modified();
+        let mut removed_colliders = colliders.take_removed();
+
+        super::user_changes::handle_user_changes_to_colliders(
+            bodies,
+            colliders,
+            &modified_colliders[..],
+        );
+
+        let mut modified_bodies = bodies.take_modified();
+        super::user_changes::handle_user_changes_to_rigid_bodies(
+            Some(islands),
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            &modified_bodies,
+            &mut modified_colliders,
+        );
+
+        // Disabled colliders are treated as if they were removed.
+        // NOTE: this must be called here, after handle_user_changes_to_rigid_bodies to take into
+        //       account colliders disabled because of their parent rigid-body.
+        removed_colliders.extend(
+            modified_colliders
+                .iter()
+                .copied()
+                .filter(|h| colliders.get(*h).map(|c| !c.is_enabled()).unwrap_or(false)),
+        );
+        self.counters.stages.user_changes.pause();
+
+        self.detect_collisions(
+            integration_parameters,
+            islands,
+            broad_phase,
+            narrow_phase,
+            bodies,
+            colliders,
+            impulse_joints,
+            multibody_joints,
+            &modified_colliders,
+            &removed_colliders,
+            hooks,
+            events,
+            true,
+        );
+
+        self.counters.stages.user_changes.resume();
+        self.clear_modified_colliders(colliders, &mut modified_colliders);
+        self.clear_modified_bodies(bodies, &mut modified_bodies);
+        removed_colliders.clear();
+        self.counters.stages.user_changes.pause();
+
+        // Finally, make sure we update the world mass-properties of the rigid-bodies
+        // that moved. Otherwise, users may end up applying forces with respect to an
+        // outdated center of mass.
+        // TODO: avoid updating the world mass properties twice (here, and
+        //       at the beginning of the next timestep) for bodies that were
+        //       not modified by the user in the mean time.
+        self.counters.stages.update_time.resume();
+        for handle in islands.active_bodies() {
+            let rb = bodies.index_mut_internal(*handle);
+            rb.mprops
+                .update_world_mass_properties(rb.body_type, &rb.pos.position);
+        }
+        self.counters.stages.update_time.pause();
+
+        // Re-insert the modified vector we extracted for the borrow-checker.
+        colliders.set_modified(modified_colliders);
+
+        self.counters.step_completed();
+    }
 }
 
 #[cfg(test)]
